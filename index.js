@@ -141,7 +141,7 @@ app.get("/music/search", async (req, res) => {
   if (pendingSearches.has(key)) return res.json(await pendingSearches.get(key));
 
   const promise = (async () => {
-    const result = await yts.GetListByKeyword(keyword, true, 1);
+    const result = await yts.GetListByKeyword(keyword, true, 15);
 
     const items = [];
 
@@ -163,8 +163,8 @@ app.get("/music/search", async (req, res) => {
           Number(parts[0]) * 3600 + Number(parts[1]) * 60 + Number(parts[2]);
       }
 
-      // > 10 phút
-      if (totalSeconds > 600) continue;
+      // > 8 phút
+      if (totalSeconds > 480) continue;
 
       items.push({
         id: item.id,
