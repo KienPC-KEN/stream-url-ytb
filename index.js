@@ -141,7 +141,7 @@ app.get("/music/search", async (req, res) => {
   if (pendingSearches.has(key)) return res.json(await pendingSearches.get(key));
 
   const promise = (async () => {
-    const result = await yts.GetListByKeyword(keyword, false, 1);
+    const result = await yts.GetListByKeyword(keyword, true, 1);
 
     const items = [];
 
