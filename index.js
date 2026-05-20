@@ -36,21 +36,29 @@ const pendingSearches = new Map();
 const fetchStream = async (videoUrl) => {
   const result = await youtubedl.exec(videoUrl, {
     ...YT_DLP_FLAGS,
-    print: "url\nduration",
+    print: ["url", "duration"],
     format: AUDIO_FORMAT,
   });
 
   const stdout =
     typeof result === "string" ? result : String(result?.stdout ?? "");
 
-  const [rawUrl, rawDuration] = stdout.trim().split("\n");
-  const streamUrl = rawUrl?.trim() ?? "";
+  const lines = stdout
+    .split("\n")
+    .map((v) => v.trim())
+    .filter(Boolean);
+
+  const streamUrl = lines[0];
+  const duration = Number(lines[1]) || null;
+
+  // const [rawUrl, rawDuration] = stdout.trim().split("\n");
+  // const streamUrl = rawUrl?.trim() ?? "";
 
   if (!streamUrl) throw new Error("yt-dlp returned empty stream URL");
 
   return {
     streamUrl,
-    duration: parseFloat(rawDuration) || null,
+    duration: parseFloat(duration) || null,
   };
 };
 
