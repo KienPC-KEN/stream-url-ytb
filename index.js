@@ -51,9 +51,6 @@ const fetchStream = async (videoUrl) => {
   const streamUrl = lines[0];
   const duration = Number(lines[1]) || null;
 
-  // const [rawUrl, rawDuration] = stdout.trim().split("\n");
-  // const streamUrl = rawUrl?.trim() ?? "";
-
   if (!streamUrl) throw new Error("yt-dlp returned empty stream URL");
 
   return {
