@@ -28,16 +28,23 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    curl
+    curl \
+    python3 \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
+# Cài yt-dlp bản mới nhất, đặt đúng quyền
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    -o /usr/local/bin/yt-dlp
+    -o /usr/local/bin/yt-dlp \
+    && chmod 755 /usr/local/bin/yt-dlp
 
-RUN chmod a+rx /usr/local/bin/yt-dlp
+# Verify yt-dlp chạy được
+RUN yt-dlp --version
 
 COPY package*.json ./
 
-RUN npm install --ignore-scripts
+# KHÔNG dùng --ignore-scripts: youtube-dl-exec cần postinstall để tự config
+RUN npm install
 
 COPY . .
 
