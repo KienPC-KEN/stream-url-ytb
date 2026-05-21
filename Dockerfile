@@ -21,7 +21,7 @@
 
 # CMD ["node", "index.js"]
 
-FROM node:20-bullseye
+FROM node:20-bookworm
 
 WORKDIR /app
 

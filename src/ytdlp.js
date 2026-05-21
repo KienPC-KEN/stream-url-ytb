@@ -1,5 +1,7 @@
 const youtubedl = require("youtube-dl-exec").create("yt-dlp");
 const { streamCache } = require("./cache");
+const path = require("path");
+const fs = require("fs");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -7,10 +9,9 @@ const AUDIO_FORMAT =
   "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio";
 
 const STREAM_URL_TTL_MS = 55 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 15_000;
+const FETCH_TIMEOUT_MS = 20_000;
 const STREAM_REFRESH_THRESHOLD_MS = 5 * 60 * 1000;
 
-// Các cụm từ trong stderr → video không bao giờ available, không cần retry
 const PERMANENT_ERROR_PATTERNS = [
   "not available",
   "has been removed",
@@ -18,10 +19,29 @@ const PERMANENT_ERROR_PATTERNS = [
   "This video is unavailable",
   "copyright",
   "account associated",
+  "This video is not available",
 ];
 
 const isPermanentError = (message = "") =>
   PERMANENT_ERROR_PATTERNS.some((p) => message.includes(p));
+
+// ─── Cookies ──────────────────────────────────────────────────────────────────
+// Render không có browser → dùng file cookies.txt (Netscape format).
+// Đặt file tại /app/cookies.txt hoặc trỏ qua env YTDLP_COOKIES_FILE.
+// Hướng dẫn export: dùng extension "Get cookies.txt LOCALLY" trên Chrome/Firefox,
+// đăng nhập YouTube rồi export, upload lên Render dưới dạng Secret File.
+
+const COOKIES_FILE =
+  process.env.YTDLP_COOKIES_FILE ?? path.join(process.cwd(), "cookies.txt");
+const hasCookies = fs.existsSync(COOKIES_FILE);
+
+if (hasCookies) {
+  console.log(`[yt-dlp] Using cookies file: ${COOKIES_FILE}`);
+} else {
+  console.warn(
+    "[yt-dlp] No cookies file found — YouTube may block datacenter IPs.",
+  );
+}
 
 const YT_DLP_FLAGS = {
   noWarnings: true,
@@ -29,9 +49,12 @@ const YT_DLP_FLAGS = {
   noPlaylist: true,
   socketTimeout: 15,
   retries: 3,
+  // Dùng cookies nếu có
+  ...(hasCookies ? { cookies: COOKIES_FILE } : {}),
 };
 
-// Key: videoUrl → Promise<payload>
+// ─── Pending map ──────────────────────────────────────────────────────────────
+
 const pendingStreams = new Map();
 
 // ─── Core fetch ───────────────────────────────────────────────────────────────
@@ -91,7 +114,6 @@ const UNAVAILABLE_SENTINEL = "__unavailable__";
 const getOrFetchStream = (videoUrl) => {
   const key = `stream:${videoUrl}`;
 
-  // Đã biết là unavailable → reject ngay, không retry
   const cached = streamCache.get(key);
   if (cached === UNAVAILABLE_SENTINEL) {
     return Promise.reject(
@@ -109,7 +131,6 @@ const getOrFetchStream = (videoUrl) => {
       return payload;
     })
     .catch((err) => {
-      // Cache kết quả "unavailable" với TTL ngắn hơn (30 phút) để không thử lại liên tục
       if (err.permanent) streamCache.set(key, UNAVAILABLE_SENTINEL, 1800);
       throw err;
     })
@@ -124,7 +145,7 @@ const getOrFetchStream = (videoUrl) => {
 const fetchStreamSilently = (videoUrl, label = "bg") => {
   const key = `stream:${videoUrl}`;
   const cached = streamCache.get(key);
-  if (cached || pendingStreams.has(key)) return; // có rồi (kể cả sentinel)
+  if (cached || pendingStreams.has(key)) return;
 
   getOrFetchStream(videoUrl)
     .then(() => console.log(`[stream:${label}] ✓ ${videoUrl}`))
@@ -145,7 +166,7 @@ const refreshStreamSilently = (videoUrl) => {
     );
 };
 
-const prefetchTopResults = (items, n = 2, staggerMs = 800) => {
+const prefetchTopResults = (items, n = 3, staggerMs = 800) => {
   items.slice(0, n).forEach((item, idx) => {
     setTimeout(() => {
       fetchStreamSilently(
