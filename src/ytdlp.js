@@ -54,6 +54,8 @@ const YT_DLP_FLAGS = {
 };
 
 // ─── Pending map ──────────────────────────────────────────────────────────────
+console.log("[cookies] file exists:", fs.existsSync(COOKIES_FILE));
+console.log("[cookies] path:", COOKIES_FILE);
 
 const pendingStreams = new Map();
 
