@@ -5,8 +5,7 @@ const fs = require("fs");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const AUDIO_FORMAT =
-  "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio";
+const AUDIO_FORMAT = "bestaudio/best";
 
 const STREAM_URL_TTL_MS = 55 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 20_000;
@@ -54,8 +53,6 @@ const YT_DLP_FLAGS = {
 };
 
 // ─── Pending map ──────────────────────────────────────────────────────────────
-console.log("[cookies] file exists:", fs.existsSync(COOKIES_FILE));
-console.log("[cookies] path:", COOKIES_FILE);
 
 const pendingStreams = new Map();
 
