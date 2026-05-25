@@ -3,26 +3,160 @@ const cors = require("cors");
 const youtubedl = require("youtube-dl-exec").create("yt-dlp");
 const yts = require("youtube-search-api");
 const NodeCache = require("node-cache");
+const fs = require("fs");
+const path = require("path");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 const STREAM_REFRESH_THRESHOLD_MS = 5 * 60 * 1000; // refresh khi còn 5 phút
 
-const AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio";
+const AUDIO_FORMAT =
+  process.env.YT_DLP_FORMAT || "139/140/bestaudio[ext=m4a]/bestaudio";
+
+const buildYtDlpFlags = (extraFlags = {}) => ({
+  ...extraFlags,
+});
+
+const DEFAULT_USER_AGENT =
+  process.env.YT_DLP_USER_AGENT ||
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const YT_DLP_FLAGS = {
   noWarnings: true,
   noCheckCertificates: true,
   noPlaylist: true,
   socketTimeout: 5,
-  extractorArgs: "youtube:skip=dash,hls",
+  addHeader: [`referer:youtube.com`, `user-agent:${DEFAULT_USER_AGENT}`],
+};
+
+const YT_DLP_FALLBACK_FLAGS = {
+  noWarnings: true,
+  noCheckCertificates: true,
+  noPlaylist: true,
+  socketTimeout: 5,
+  addHeader: [`referer:youtube.com`, `user-agent:${DEFAULT_USER_AGENT}`],
+};
+
+const isVideoUnavailableError = (error) =>
+  /this video is not available|video unavailable|is not available/i.test(
+    String(error?.message ?? error?.stderr ?? ""),
+  );
+
+const chooseBestAudioFormat = (info) => {
+  const formats = Array.isArray(info?.formats) ? info.formats : [];
+
+  const audioOnly = formats.filter(
+    (format) =>
+      format?.url &&
+      format?.acodec &&
+      format.acodec !== "none" &&
+      (!format?.vcodec || format.vcodec === "none"),
+  );
+
+  const candidates =
+    audioOnly.length > 0 ? audioOnly : formats.filter((format) => format?.url);
+
+  const preferredExtOrder = new Map([
+    ["m4a", 0],
+    ["mp4", 1],
+    ["aac", 2],
+    ["webm", 3],
+    ["3gp", 4],
+  ]);
+
+  return candidates.slice().sort((left, right) => {
+    const leftExtScore = preferredExtOrder.has(left?.ext)
+      ? preferredExtOrder.get(left.ext)
+      : 99;
+    const rightExtScore = preferredExtOrder.has(right?.ext)
+      ? preferredExtOrder.get(right.ext)
+      : 99;
+
+    if (leftExtScore !== rightExtScore) {
+      return leftExtScore - rightExtScore;
+    }
+
+    const leftAbr = Number(left?.abr ?? Number.POSITIVE_INFINITY);
+    const rightAbr = Number(right?.abr ?? Number.POSITIVE_INFINITY);
+
+    if (leftAbr !== rightAbr) {
+      return leftAbr - rightAbr;
+    }
+
+    const leftSize = Number(
+      left?.filesize ?? left?.filesize_approx ?? Number.POSITIVE_INFINITY,
+    );
+    const rightSize = Number(
+      right?.filesize ?? right?.filesize_approx ?? Number.POSITIVE_INFINITY,
+    );
+
+    return leftSize - rightSize;
+  })[0];
 };
 
 // ─── Cache & dedup ────────────────────────────────────────────────────────────
 
 const streamCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 const searchCache = new NodeCache({ stdTTL: 600 });
+
+// Persistent disk cache for resolved streams to survive restarts
+const PERSIST_CACHE_DIR = path.join(__dirname, "cache", "streams");
+const PERSIST_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+if (!fs.existsSync(PERSIST_CACHE_DIR)) {
+  try {
+    fs.mkdirSync(PERSIST_CACHE_DIR, { recursive: true });
+  } catch (e) {
+    console.warn("Failed to create persist cache dir:", e?.message ?? e);
+  }
+}
+
+const videoUrlToFilename = (videoUrl) => {
+  try {
+    return Buffer.from(videoUrl).toString("base64").replace(/=/g, "");
+  } catch (e) {
+    return encodeURIComponent(videoUrl).replace(/[^a-zA-Z0-9-_\.]/g, "_");
+  }
+};
+
+const readDiskCache = (videoUrl) => {
+  const fname = path.join(
+    PERSIST_CACHE_DIR,
+    videoUrlToFilename(videoUrl) + ".json",
+  );
+  try {
+    if (!fs.existsSync(fname)) return null;
+    const raw = fs.readFileSync(fname, "utf8");
+    const obj = JSON.parse(raw);
+    if (!obj || !obj.storedAt) return null;
+    if (Date.now() - obj.storedAt > (obj.ttlMs ?? PERSIST_TTL_MS)) {
+      try {
+        fs.unlinkSync(fname);
+      } catch (e) {}
+      return null;
+    }
+    return obj.payload ?? null;
+  } catch (e) {
+    return null;
+  }
+};
+
+const writeDiskCache = (videoUrl, payload, ttlMs = PERSIST_TTL_MS) => {
+  const fname = path.join(
+    PERSIST_CACHE_DIR,
+    videoUrlToFilename(videoUrl) + ".json",
+  );
+  try {
+    fs.writeFileSync(
+      fname,
+      JSON.stringify({ storedAt: Date.now(), ttlMs, payload }),
+      { encoding: "utf8" },
+    );
+  } catch (e) {
+    // ignore write failures
+  }
+};
 
 const pendingStreams = new Map();
 const pendingSearches = new Map();
@@ -34,51 +168,78 @@ const pendingSearches = new Map();
  * Nhanh hơn dump-single-json vì không parse toàn bộ metadata.
  */
 const fetchStream = async (videoUrl) => {
-  const result = await youtubedl.exec(videoUrl, {
-    ...YT_DLP_FLAGS,
-    print: ["url", "duration"],
-    format: AUDIO_FORMAT,
-  });
+  const resolveWithFlags = async (flags) => {
+    const info = await youtubedl(videoUrl, {
+      ...buildYtDlpFlags(flags),
+      getUrl: true,
+      format: AUDIO_FORMAT,
+      forceIpv4: true,
+    });
 
-  const stdout =
-    typeof result === "string" ? result : String(result?.stdout ?? "");
+    // const format = chooseBestAudioFormat(info);
+    const streamUrl = String(info).trim();
 
-  const lines = stdout
-    .split("\n")
-    .map((v) => v.trim())
-    .filter(Boolean);
+    if (!streamUrl) throw new Error("yt-dlp returned empty stream URL");
 
-  const streamUrl = lines[0];
-  const duration = Number(lines[1]) || null;
-
-  if (!streamUrl) throw new Error("yt-dlp returned empty stream URL");
-
-  return {
-    streamUrl,
-    duration: parseFloat(duration) || null,
+    return {
+      streamUrl,
+      // audioExt: format?.ext ?? null,
+      // formatId: format?.format_id ?? null,
+      // abr: format?.abr ?? null,
+      // duration: null,
+    };
   };
+
+  try {
+    return await resolveWithFlags(YT_DLP_FLAGS);
+  } catch (primaryError) {
+    console.warn(
+      `[stream] primary yt-dlp config failed for ${videoUrl}:`,
+      primaryError.message,
+    );
+
+    return await resolveWithFlags(YT_DLP_FALLBACK_FLAGS);
+  }
 };
 
 // ─── Cache utilities ──────────────────────────────────────────────────────────
 
-const getRemainingTtlMs = (cache, key) => {
-  const ttl = cache.getTtl(key);
-  return ttl ? ttl - Date.now() : Infinity;
-};
-
-/**
- * Fetch + cache stream, dedup concurrent calls bằng pending map.
- * Nếu đã có pending promise (từ prefetch), reuse thay vì spawn mới.
- */
 const getOrFetchStream = (videoUrl) => {
   const key = `stream:${videoUrl}`;
 
   // Đang fetch → reuse
-  if (pendingStreams.has(key)) return pendingStreams.get(key);
+  if (pendingStreams.has(key)) {
+    console.log(`[stream-cache] pending reuse: ${videoUrl}`);
+    return pendingStreams.get(key);
+  }
+
+  // Check memory cache
+  const mem = streamCache.get(key);
+  if (mem) {
+    console.log(`[stream-cache] memory hit: ${videoUrl}`);
+    return Promise.resolve(mem);
+  }
+
+  // Check disk cache
+  try {
+    const disk = readDiskCache(videoUrl);
+    if (disk) {
+      console.log(`[stream-cache] disk hit: ${videoUrl}`);
+      streamCache.set(key, disk);
+      return Promise.resolve(disk);
+    }
+  } catch (e) {
+    // ignore disk read errors
+  }
 
   const promise = fetchStream(videoUrl)
     .then((payload) => {
       streamCache.set(key, payload);
+      try {
+        writeDiskCache(videoUrl, payload);
+      } catch (e) {
+        // ignore
+      }
       return payload;
     })
     .finally(() => pendingStreams.delete(key));
@@ -87,31 +248,95 @@ const getOrFetchStream = (videoUrl) => {
   return promise;
 };
 
-/**
- * Fire-and-forget: fetch stream ngầm, không block caller.
- * Dùng cho cả prefetch sau search lẫn proactive refresh trước khi hết TTL.
- */
-const fetchStreamSilently = (videoUrl, label = "bg") => {
-  const key = `stream:${videoUrl}`;
-  if (streamCache.has(key) || pendingStreams.has(key)) return; // đã có rồi
+// Prefetch queue with limited concurrency
+const PREFETCH_CONCURRENCY = 3;
+const prefetchQueue = [];
+let prefetchActive = 0;
 
-  getOrFetchStream(videoUrl)
-    .then(() => console.log(`[stream:${label}] ✓ ${videoUrl}`))
-    .catch((err) =>
-      console.warn(`[stream:${label}] ✗ ${videoUrl}:`, err.message),
-    );
+const processPrefetchQueue = () => {
+  while (prefetchActive < PREFETCH_CONCURRENCY && prefetchQueue.length > 0) {
+    const item = prefetchQueue.shift();
+    prefetchActive++;
+    getOrFetchStream(item.videoUrl)
+      .then(() => console.log(`[stream:${item.label}] ✓ ${item.videoUrl}`))
+      .catch((err) =>
+        console.warn(`[stream:${item.label}] ✗ ${item.videoUrl}:`, err.message),
+      )
+      .finally(() => {
+        prefetchActive--;
+        // process next
+        setImmediate(processPrefetchQueue);
+      });
+  }
 };
 
-/**
- * Proactive refresh khi cache sắp hết TTL (non-blocking).
- */
-const refreshStreamSilently = (videoUrl) => {
-  const key = `stream:${videoUrl}`;
-  if (pendingStreams.has(key)) return;
+const enqueuePrefetch = (videoUrl, label = "prefetch") => {
+  // avoid queueing duplicates
+  if (prefetchQueue.find((q) => q.videoUrl === videoUrl)) return;
+  prefetchQueue.push({ videoUrl, label });
+  processPrefetchQueue();
+};
 
-  getOrFetchStream(videoUrl).catch((err) =>
-    console.warn(`[stream:refresh] ✗ ${videoUrl}:`, err.message),
-  );
+const collectStreamBestCandidateIds = async (query, providedIds = []) => {
+  const uniqueIds = [];
+  const seen = new Set();
+
+  for (const id of providedIds) {
+    const normalized = String(id ?? "").trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    uniqueIds.push(normalized);
+    if (uniqueIds.length >= 5) return uniqueIds;
+  }
+
+  if (query) {
+    const searchKey = `search:${query.toLowerCase()}`;
+    let results = searchCache.get(searchKey);
+
+    if (!results) {
+      results = await (pendingSearches.get(searchKey) ??
+        (async () => {
+          const response = await yts.GetListByKeyword(query, true, 8);
+          const items = (response.items ?? [])
+            .slice(0, 8)
+            .filter(
+              (item) =>
+                !String(item.title ?? "")
+                  .toLowerCase()
+                  .includes("karaoke"),
+            )
+            .map((item) => ({
+              id: item.id,
+              title: item.title,
+              thumbnail: item.thumbnail?.thumbnails?.[0]?.url ?? null,
+              channel: item.channelTitle ?? null,
+              duration: item.length?.simpleText ?? null,
+            }))
+            .slice(0, 5);
+
+          searchCache.set(searchKey, items);
+          for (const item of items.slice(0, 3)) {
+            if (item?.id) {
+              enqueuePrefetch(
+                `https://www.youtube.com/watch?v=${item.id}`,
+                "search-warm",
+              );
+            }
+          }
+          return items;
+        })());
+    }
+
+    for (const item of results ?? []) {
+      const normalized = String(item?.id ?? "").trim();
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      uniqueIds.push(normalized);
+      if (uniqueIds.length >= 5) break;
+    }
+  }
+
+  return uniqueIds;
 };
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -120,127 +345,64 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── GET /music/search?keyword= ───────────────────────────────────────────────
+// POST /music/prefetch { videoUrls: string[] }
+app.post("/music/prefetch", (req, res) => {
+  try {
+    const urls = Array.isArray(req.body?.videoUrls) ? req.body.videoUrls : [];
+    for (const u of urls.slice(0, 50)) {
+      if (typeof u === "string" && u.trim())
+        enqueuePrefetch(u.trim(), "prefetch-api");
+    }
 
-app.get("/music/search", async (req, res) => {
-  const keyword = String(req.query.keyword ?? "").trim();
-  if (!keyword) return res.status(400).json({ message: "Missing keyword" });
-
-  const key = `search:${keyword.toLowerCase()}`;
-
-  // Cache hit
-  const cached = searchCache.get(key);
-  if (cached) {
-    console.log(`[search] cache hit: "${keyword}"`);
-    // Prefetch lại nếu stream cache đã expire (server restart, TTL ngắn hơn)
-    const firstId = cached[0]?.id;
-    if (firstId)
-      fetchStreamSilently(
-        `https://www.youtube.com/watch?v=${firstId}`,
-        "prefetch",
-      );
-    return res.json(cached);
+    return res.json({ queued: urls.length });
+  } catch (e) {
+    return res.status(400).json({ message: "Invalid request" });
   }
+});
 
-  // Dedup
-  if (pendingSearches.has(key)) return res.json(await pendingSearches.get(key));
+app.post("/music/stream-best", async (req, res) => {
+  const start = Date.now();
 
-  const promise = (async () => {
-    const result = await yts.GetListByKeyword(keyword, true, 15);
+  try {
+    const query = String(req.body?.query ?? "").trim();
 
-    const items = [];
-
-    for (const item of result.items ?? []) {
-      const title = String(item.title ?? "").toLowerCase();
-
-      // Skip karaoke
-      if (title.includes("karaoke")) continue;
-
-      const durationText = item.length?.simpleText ?? "";
-      const parts = durationText.split(":");
-
-      let totalSeconds = 0;
-
-      if (parts.length === 2) {
-        totalSeconds = Number(parts[0]) * 60 + Number(parts[1]);
-      } else if (parts.length === 3) {
-        totalSeconds =
-          Number(parts[0]) * 3600 + Number(parts[1]) * 60 + Number(parts[2]);
-      }
-
-      // > 8 phút
-      if (totalSeconds > 480) continue;
-
-      items.push({
-        id: item.id,
-        title: item.title,
-        thumbnail:
-          item.thumbnail?.thumbnails?.[0]?.url ?? item.thumbnail?.url ?? null,
-        channel: item.channelTitle ?? null,
-        duration: durationText || null,
+    if (!query) {
+      return res.status(400).json({
+        message: "Missing query",
       });
     }
 
-    searchCache.set(key, items);
+    const videoIds = await collectStreamBestCandidateIds(query);
 
-    // Prefetch stream ngầm cho item duy nhất — không block response
-    // Khi user bấm play, stream đã sẵn sàng trong cache → ~0ms
-    const firstId = items[0]?.id;
-    if (firstId) {
-      const videoUrl = `https://www.youtube.com/watch?v=${firstId}`;
-      fetchStreamSilently(videoUrl, "prefetch");
+    if (!videoIds.length) {
+      return res.status(404).json({
+        message: "No candidates found",
+      });
     }
 
-    return items;
-  })()
-    .catch((err) => {
-      console.error("[search] error:", err.message);
-      throw err;
-    })
-    .finally(() => pendingSearches.delete(key));
+    const winner = await Promise.any(
+      videoIds.slice(0, 5).map(async (id) => {
+        const videoUrl = `https://www.youtube.com/watch?v=${id}`;
 
-  pendingSearches.set(key, promise);
+        const { streamUrl } = await getOrFetchStream(videoUrl);
 
-  try {
-    return res.json(await promise);
-  } catch {
-    return res.status(500).json({ message: "Search failed" });
-  }
-});
+        return streamUrl;
+      }),
+    );
 
-// ─── GET /music/stream?url= ───────────────────────────────────────────────────
+    console.log(`[stream-best] resolved "${query}" in ${Date.now() - start}ms`);
 
-app.get("/music/stream", async (req, res) => {
-  const start = Date.now();
-  const videoUrl = String(req.query.url ?? "").trim();
-  if (!videoUrl) return res.status(400).json({ message: "Missing url" });
-
-  const key = `stream:${videoUrl}`;
-  const elapsed = () => `${Date.now() - start}ms`;
-
-  try {
-    // Cache hit
-    const cached = streamCache.get(key);
-    if (cached) {
-      // Proactive refresh nếu gần hết TTL
-      if (getRemainingTtlMs(streamCache, key) < STREAM_REFRESH_THRESHOLD_MS) {
-        console.log(`[stream] proactive refresh: ${videoUrl}`);
-        refreshStreamSilently(videoUrl);
-      }
-      console.log(`[stream] cache hit (${elapsed()})`);
-      return res.json({ ...cached, executionTime: elapsed() });
-    }
-
-    // Pending hoặc cold fetch — getOrFetchStream dedup tự động
-    const payload = await getOrFetchStream(videoUrl);
-    console.log(`[stream] fetched (${elapsed()})`);
-    return res.json({ ...payload, executionTime: elapsed() });
+    return res.json({
+      streamUrl: winner,
+    });
   } catch (err) {
-    console.error("[stream] error:", err.message);
-    return res.status(500).json({ message: "Get stream failed" });
+    console.warn(`[stream-best] failed "${req.body?.query}":`, err?.message);
+
+    return res.status(404).json({
+      message: "No playable stream found",
+    });
   }
 });
-
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
