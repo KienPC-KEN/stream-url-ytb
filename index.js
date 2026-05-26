@@ -23,6 +23,7 @@ const YT_DLP_FLAGS = {
   noPlaylist: true,
   socketTimeout: 5,
   addHeader: [`referer:youtube.com`, `user-agent:${DEFAULT_USER_AGENT}`],
+  cookies: "./cookies.txt",
 };
 
 // ─── Cache & dedup ────────────────────────────────────────────────────────────
