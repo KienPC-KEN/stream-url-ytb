@@ -1,6 +1,13 @@
 node_modules
 npm-debug.log
+
 .git
 .gitignore
+
+cache
+*.log
+
+.vscode
+.idea
+
 .env
-*.md
