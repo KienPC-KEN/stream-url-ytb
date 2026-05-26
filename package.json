@@ -4,8 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "ts-node-dev --respawn src/index.ts"
+    "dev": "nodemon index.js",
+    "start": "node index.js",
+    "postinstall": "pip install yt-dlp"
   },
   "keywords": [],
   "author": "",
@@ -17,5 +18,8 @@
     "node-cache": "^5.1.2",
     "youtube-dl-exec": "^3.1.7",
     "youtube-search-api": "^2.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
   }
 }
