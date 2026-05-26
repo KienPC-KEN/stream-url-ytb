@@ -11,7 +11,7 @@ const path = require("path");
 const PORT = process.env.PORT || 3000;
 
 const AUDIO_FORMAT =
-  process.env.YT_DLP_FORMAT || "139/140/bestaudio[ext=m4a]/bestaudio";
+  process.env.YT_DLP_FORMAT || "bestaudio[ext=m4a]/bestaudio/best";
 
 const DEFAULT_USER_AGENT =
   process.env.YT_DLP_USER_AGENT ||
