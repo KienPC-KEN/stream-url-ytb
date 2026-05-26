@@ -9,9 +9,10 @@ const path = require("path");
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
+const COOKIE_PATH = path.join(__dirname, "cookies.txt");
 
 const AUDIO_FORMAT =
-  process.env.YT_DLP_FORMAT || "bestaudio[ext=m4a]/bestaudio/best";
+  process.env.YT_DLP_FORMAT || "139/140/bestaudio[ext=m4a]/bestaudio";
 
 const DEFAULT_USER_AGENT =
   process.env.YT_DLP_USER_AGENT ||
@@ -23,6 +24,7 @@ const YT_DLP_FLAGS = {
   noPlaylist: true,
   socketTimeout: 5,
   addHeader: [`referer:youtube.com`, `user-agent:${DEFAULT_USER_AGENT}`],
+  cookies: COOKIE_PATH,
   extractorArgs: "youtube:player_client=android",
 };
 
@@ -108,7 +110,7 @@ const fetchStream = async (videoUrl) => {
       getUrl: true,
       format: AUDIO_FORMAT,
       forceIpv4: true,
-      extractorArgs: "youtube:player_client=android",
+      geoBypass: true,
     });
 
     const streamUrl = String(info).trim();
@@ -117,22 +119,13 @@ const fetchStream = async (videoUrl) => {
   };
 
   try {
-    return await resolveWithFlags(
-      YT_DLP_FLAGS,
-      "bestaudio[ext=m4a]/bestaudio/best",
-    );
+    return await resolveWithFlags(YT_DLP_FLAGS);
   } catch (primaryError) {
     console.warn(
       `[stream] primary yt-dlp config failed for ${videoUrl}:`,
       primaryError.message,
     );
-    return await resolveWithFlags(
-      {
-        ...YT_DLP_FLAGS,
-        cookies: undefined,
-      },
-      "bestaudio/best",
-    );
+    return await resolveWithFlags(YT_DLP_FLAGS);
   }
 };
 
