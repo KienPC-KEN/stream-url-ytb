@@ -9,7 +9,6 @@ const path = require("path");
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-const COOKIE_PATH = path.join(__dirname, "cookies.txt");
 
 const AUDIO_FORMAT =
   process.env.YT_DLP_FORMAT || "139/140/bestaudio[ext=m4a]/bestaudio";
@@ -24,8 +23,6 @@ const YT_DLP_FLAGS = {
   noPlaylist: true,
   socketTimeout: 5,
   addHeader: [`referer:youtube.com`, `user-agent:${DEFAULT_USER_AGENT}`],
-  cookies: COOKIE_PATH,
-  extractorArgs: "youtube:player_client=android",
 };
 
 // ─── Cache & dedup ────────────────────────────────────────────────────────────
@@ -96,21 +93,12 @@ const pendingSearches = new Map();
 // ─── yt-dlp helpers ───────────────────────────────────────────────────────────
 
 const fetchStream = async (videoUrl) => {
-  if (
-    !videoUrl ||
-    typeof videoUrl !== "string" ||
-    !videoUrl.startsWith("http")
-  ) {
-    throw new Error("Invalid YouTube URL");
-  }
-
   const resolveWithFlags = async (flags) => {
     const info = await youtubedl(videoUrl, {
       ...flags,
       getUrl: true,
       format: AUDIO_FORMAT,
       forceIpv4: true,
-      geoBypass: true,
     });
 
     const streamUrl = String(info).trim();
