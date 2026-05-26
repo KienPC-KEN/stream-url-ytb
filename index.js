@@ -23,7 +23,7 @@ const YT_DLP_FLAGS = {
   noPlaylist: true,
   socketTimeout: 5,
   addHeader: [`referer:youtube.com`, `user-agent:${DEFAULT_USER_AGENT}`],
-  cookies: "./cookies.txt",
+  extractorArgs: "youtube:player_client=android",
 };
 
 // ─── Cache & dedup ────────────────────────────────────────────────────────────
@@ -94,12 +94,21 @@ const pendingSearches = new Map();
 // ─── yt-dlp helpers ───────────────────────────────────────────────────────────
 
 const fetchStream = async (videoUrl) => {
+  if (
+    !videoUrl ||
+    typeof videoUrl !== "string" ||
+    !videoUrl.startsWith("http")
+  ) {
+    throw new Error("Invalid YouTube URL");
+  }
+
   const resolveWithFlags = async (flags) => {
     const info = await youtubedl(videoUrl, {
       ...flags,
       getUrl: true,
       format: AUDIO_FORMAT,
       forceIpv4: true,
+      extractorArgs: "youtube:player_client=android",
     });
 
     const streamUrl = String(info).trim();
@@ -108,13 +117,22 @@ const fetchStream = async (videoUrl) => {
   };
 
   try {
-    return await resolveWithFlags(YT_DLP_FLAGS);
+    return await resolveWithFlags(
+      YT_DLP_FLAGS,
+      "bestaudio[ext=m4a]/bestaudio/best",
+    );
   } catch (primaryError) {
     console.warn(
       `[stream] primary yt-dlp config failed for ${videoUrl}:`,
       primaryError.message,
     );
-    return await resolveWithFlags(YT_DLP_FLAGS);
+    return await resolveWithFlags(
+      {
+        ...YT_DLP_FLAGS,
+        cookies: undefined,
+      },
+      "bestaudio/best",
+    );
   }
 };
 
