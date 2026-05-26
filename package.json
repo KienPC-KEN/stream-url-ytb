@@ -5,8 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dev": "nodemon index.js",
-    "start": "node index.js",
-    "postinstall": "pip install yt-dlp"
+    "start": "node index.js"
   },
   "keywords": [],
   "author": "",
