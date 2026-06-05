@@ -1,6 +1,6 @@
 const express = require("express");
 const cors = require("cors");
-const youtubedl = require("youtube-dl-exec").create("yt-dlp");
+const youtubedl = require("youtube-dl-exec");
 const yts = require("youtube-search-api");
 const NodeCache = require("node-cache");
 const fs = require("fs");
@@ -93,28 +93,23 @@ const pendingSearches = new Map();
 // ─── yt-dlp helpers ───────────────────────────────────────────────────────────
 
 const fetchStream = async (videoUrl) => {
-  const resolveWithFlags = async (flags) => {
-    const info = await youtubedl(videoUrl, {
-      ...flags,
-      getUrl: true,
-      format: AUDIO_FORMAT,
-      forceIpv4: true,
-    });
+  const info = await youtubedl(videoUrl, {
+    getUrl: true,
+    format: AUDIO_FORMAT,
+    noWarnings: true,
+    noCheckCertificates: true,
+    noPlaylist: true,
+    forceIpv4: true,
+    addHeader: [`referer:youtube.com`, `user-agent:${DEFAULT_USER_AGENT}`],
+  });
 
-    const streamUrl = String(info).trim();
-    if (!streamUrl) throw new Error("yt-dlp returned empty stream URL");
-    return { streamUrl };
-  };
+  const streamUrl = String(info).trim();
 
-  try {
-    return await resolveWithFlags(YT_DLP_FLAGS);
-  } catch (primaryError) {
-    console.warn(
-      `[stream] primary yt-dlp config failed for ${videoUrl}:`,
-      primaryError.message,
-    );
-    return await resolveWithFlags(YT_DLP_FLAGS);
+  if (!streamUrl) {
+    throw new Error("Empty stream URL");
   }
+
+  return { streamUrl };
 };
 
 // ─── Cache utilities ──────────────────────────────────────────────────────────
