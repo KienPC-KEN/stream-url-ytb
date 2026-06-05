@@ -16,7 +16,8 @@
     "express": "^5.2.1",
     "node-cache": "^5.1.2",
     "youtube-dl-exec": "^3.1.7",
-    "youtube-search-api": "^2.0.1"
+    "youtube-search-api": "^2.0.1",
+    "yt-search": "^2.13.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
