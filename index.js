@@ -1,344 +1,316 @@
-const express = require("express");
-const cors = require("cors");
-const youtubedl = require("youtube-dl-exec");
-const yts = require("youtube-search-api");
-const NodeCache = require("node-cache");
-const fs = require("fs");
-const path = require("path");
+import express from "express";
+import cors from "cors";
+import NodeCache from "node-cache";
+import yts from "@vreden/youtube_scraper";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 
-const AUDIO_FORMAT =
-  process.env.YT_DLP_FORMAT || "139/140/bestaudio[ext=m4a]/bestaudio";
+const SEARCH_CACHE_TTL = 600;
+const MP3_CACHE_TTL = 900;
 
-const DEFAULT_USER_AGENT =
-  process.env.YT_DLP_USER_AGENT ||
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+// ─────────────────────────────────────────────────────────────
+// CACHE
+// ─────────────────────────────────────────────────────────────
 
-const YT_DLP_FLAGS = {
-  noWarnings: true,
-  noCheckCertificates: true,
-  noPlaylist: true,
-  socketTimeout: 5,
-  addHeader: [`referer:youtube.com`, `user-agent:${DEFAULT_USER_AGENT}`],
-};
+const searchCache = new NodeCache({
+  stdTTL: SEARCH_CACHE_TTL,
+  checkperiod: 120,
+});
 
-// ─── Cache & dedup ────────────────────────────────────────────────────────────
+const mp3Cache = new NodeCache({
+  stdTTL: MP3_CACHE_TTL,
+  checkperiod: 120,
+});
 
-const streamCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
-const searchCache = new NodeCache({ stdTTL: 600 });
-
-const PERSIST_CACHE_DIR = path.join(__dirname, "cache", "streams");
-const PERSIST_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-
-if (!fs.existsSync(PERSIST_CACHE_DIR)) {
-  try {
-    fs.mkdirSync(PERSIST_CACHE_DIR, { recursive: true });
-  } catch (e) {
-    console.warn("Failed to create persist cache dir:", e?.message ?? e);
-  }
-}
-
-const videoUrlToFilename = (videoUrl) => {
-  try {
-    return Buffer.from(videoUrl).toString("base64").replace(/=/g, "");
-  } catch (e) {
-    return encodeURIComponent(videoUrl).replace(/[^a-zA-Z0-9-_\.]/g, "_");
-  }
-};
-
-const readDiskCache = (videoUrl) => {
-  const fname = path.join(
-    PERSIST_CACHE_DIR,
-    videoUrlToFilename(videoUrl) + ".json",
-  );
-  try {
-    if (!fs.existsSync(fname)) return null;
-    const raw = fs.readFileSync(fname, "utf8");
-    const obj = JSON.parse(raw);
-    if (!obj?.storedAt) return null;
-    if (Date.now() - obj.storedAt > (obj.ttlMs ?? PERSIST_TTL_MS)) {
-      try {
-        fs.unlinkSync(fname);
-      } catch (e) {}
-      return null;
-    }
-    return obj.payload ?? null;
-  } catch (e) {
-    return null;
-  }
-};
-
-const writeDiskCache = (videoUrl, payload, ttlMs = PERSIST_TTL_MS) => {
-  const fname = path.join(
-    PERSIST_CACHE_DIR,
-    videoUrlToFilename(videoUrl) + ".json",
-  );
-  try {
-    fs.writeFileSync(
-      fname,
-      JSON.stringify({ storedAt: Date.now(), ttlMs, payload }),
-      { encoding: "utf8" },
-    );
-  } catch (e) {
-    // ignore write failures
-  }
-};
-
-const pendingStreams = new Map();
 const pendingSearches = new Map();
+const pendingMp3 = new Map();
 
-// ─── yt-dlp helpers ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// LOGGER
+// ─────────────────────────────────────────────────────────────
 
-const fetchStream = async (videoUrl) => {
-  const info = await youtubedl(videoUrl, {
-    getUrl: true,
-    format: AUDIO_FORMAT,
-    noWarnings: true,
-    noCheckCertificates: true,
-    noPlaylist: true,
-    forceIpv4: true,
-    addHeader: [`referer:youtube.com`, `user-agent:${DEFAULT_USER_AGENT}`],
-  });
+const now = () => performance.now();
 
-  const streamUrl = String(info).trim();
+const logTime = (label, start) => {
+  const ms = (now() - start).toFixed(0);
 
-  if (!streamUrl) {
-    throw new Error("Empty stream URL");
-  }
-
-  return { streamUrl };
+  console.log(`⚡ ${label}: ${ms}ms`);
 };
 
-// ─── Cache utilities ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
 
-const getOrFetchStream = (videoUrl) => {
-  const key = `stream:${videoUrl}`;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  if (pendingStreams.has(key)) {
-    console.log(`[stream-cache] pending reuse: ${videoUrl}`);
-    return pendingStreams.get(key);
-  }
+const retry = async (fn, retries = 2) => {
+  let lastError;
 
-  const mem = streamCache.get(key);
-  if (mem) {
-    console.log(`[stream-cache] memory hit: ${videoUrl}`);
-    return Promise.resolve(mem);
-  }
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
 
-  try {
-    const disk = readDiskCache(videoUrl);
-    if (disk) {
-      console.log(`[stream-cache] disk hit: ${videoUrl}`);
-      streamCache.set(key, disk);
-      return Promise.resolve(disk);
-    }
-  } catch (e) {
-    // ignore
-  }
-
-  const promise = fetchStream(videoUrl)
-    .then((payload) => {
-      streamCache.set(key, payload);
-      try {
-        writeDiskCache(videoUrl, payload);
-      } catch (e) {}
-      return payload;
-    })
-    .finally(() => pendingStreams.delete(key));
-
-  pendingStreams.set(key, promise);
-  return promise;
-};
-
-// ─── Prefetch queue ───────────────────────────────────────────────────────────
-
-const PREFETCH_CONCURRENCY = 3;
-const prefetchQueue = [];
-let prefetchActive = 0;
-
-const processPrefetchQueue = () => {
-  while (prefetchActive < PREFETCH_CONCURRENCY && prefetchQueue.length > 0) {
-    const item = prefetchQueue.shift();
-    prefetchActive++;
-    getOrFetchStream(item.videoUrl)
-      .then(() => console.log(`[stream:${item.label}] ✓ ${item.videoUrl}`))
-      .catch((err) =>
-        console.warn(`[stream:${item.label}] ✗ ${item.videoUrl}:`, err.message),
-      )
-      .finally(() => {
-        prefetchActive--;
-        setImmediate(processPrefetchQueue);
-      });
-  }
-};
-
-const enqueuePrefetch = (videoUrl, label = "prefetch") => {
-  if (prefetchQueue.find((q) => q.videoUrl === videoUrl)) return;
-  prefetchQueue.push({ videoUrl, label });
-  processPrefetchQueue();
-};
-
-// ─── Search helpers ───────────────────────────────────────────────────────────
-
-const searchYouTube = async (query) => {
-  const searchKey = `search:${query.toLowerCase()}`;
-
-  const cached = searchCache.get(searchKey);
-  if (cached) return cached;
-
-  const pending = pendingSearches.get(searchKey);
-  if (pending) return pending;
-
-  const promise = (async () => {
-    const response = await yts.GetListByKeyword(query, true, 8);
-    const items = (response.items ?? [])
-      .slice(0, 8)
-      .filter(
-        (item) =>
-          !String(item.title ?? "")
-            .toLowerCase()
-            .includes("karaoke"),
-      )
-      .map((item) => ({
-        id: item.id,
-        title: item.title,
-        thumbnail: item.thumbnail?.thumbnails?.[0]?.url ?? null,
-        channel: item.channelTitle ?? null,
-        duration: item.length?.simpleText ?? null,
-      }))
-      .slice(0, 5);
-
-    searchCache.set(searchKey, items);
-
-    // Warm cache for top results
-    for (const item of items.slice(0, 3)) {
-      if (item?.id) {
-        enqueuePrefetch(
-          `https://www.youtube.com/watch?v=${item.id}`,
-          "search-warm",
-        );
+      if (i < retries) {
+        await sleep(500);
       }
     }
+  }
 
-    return items;
-  })().finally(() => pendingSearches.delete(searchKey));
+  throw lastError;
+};
 
-  pendingSearches.set(searchKey, promise);
+const filterResults = (results = []) => {
+  return results
+    .filter((item) => {
+      const title = String(item.title || "").toLowerCase();
+
+      return (
+        !title.includes("karaoke") &&
+        !title.includes("live") &&
+        !title.includes("remix") &&
+        !title.includes("slowed") &&
+        !title.includes("8d")
+      );
+    })
+    .slice(0, 5)
+    .map((item) => ({
+      title: item.title,
+      url: item.url,
+      thumbnail: item.thumbnail,
+      duration: item.duration,
+    }));
+};
+
+// ─────────────────────────────────────────────────────────────
+// SEARCH
+// ─────────────────────────────────────────────────────────────
+
+const searchYouTube = async (query) => {
+  const normalized = query.toLowerCase().trim();
+
+  const cacheKey = `search:${normalized}`;
+
+  const cached = searchCache.get(cacheKey);
+
+  if (cached) {
+    console.log(`🟢 SEARCH CACHE HIT: ${normalized}`);
+
+    return cached;
+  }
+
+  console.log(`🟡 SEARCH CACHE MISS: ${normalized}`);
+
+  if (pendingSearches.has(cacheKey)) {
+    return pendingSearches.get(cacheKey);
+  }
+
+  const promise = retry(async () => {
+    const start = now();
+
+    const results = await yts.search(normalized);
+
+    logTime(`YouTube search "${normalized}"`, start);
+
+    const filtered = filterResults(results.results || []);
+
+    searchCache.set(cacheKey, filtered);
+
+    return filtered;
+  }).finally(() => {
+    pendingSearches.delete(cacheKey);
+  });
+
+  pendingSearches.set(cacheKey, promise);
+
   return promise;
 };
 
-const collectStreamCandidateIds = async (query, providedIds = []) => {
-  const uniqueIds = [];
-  const seen = new Set();
+// ─────────────────────────────────────────────────────────────
+// MP3
+// ─────────────────────────────────────────────────────────────
 
-  for (const id of providedIds) {
-    const normalized = String(id ?? "").trim();
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    uniqueIds.push(normalized);
-    if (uniqueIds.length >= 5) return uniqueIds;
-  }
+const fetchMp3 = async (url) => {
+  return retry(async () => {
+    const start = now();
 
-  if (query) {
-    const results = await searchYouTube(query);
-    for (const item of results ?? []) {
-      const normalized = String(item?.id ?? "").trim();
-      if (!normalized || seen.has(normalized)) continue;
-      seen.add(normalized);
-      uniqueIds.push(normalized);
-      if (uniqueIds.length >= 5) break;
+    const data = await yts.ytmp3(url, 92);
+
+    logTime(`MP3 fetch`, start);
+
+    if (!data?.download) {
+      throw new Error("MP3 not found");
     }
-  }
 
-  return uniqueIds;
+    return data.download;
+  });
 };
 
-// ─── App ──────────────────────────────────────────────────────────────────────
+const getOrFetchMp3 = async (url) => {
+  const cacheKey = `mp3:${url}`;
+
+  const cached = mp3Cache.get(cacheKey);
+
+  if (cached) {
+    console.log(`🟢 MP3 CACHE HIT`);
+
+    return cached;
+  }
+
+  console.log(`🟡 MP3 CACHE MISS`);
+
+  if (pendingMp3.has(cacheKey)) {
+    return pendingMp3.get(cacheKey);
+  }
+
+  const promise = fetchMp3(url)
+    .then((data) => {
+      mp3Cache.set(cacheKey, data);
+
+      return data;
+    })
+    .finally(() => {
+      pendingMp3.delete(cacheKey);
+    });
+
+  pendingMp3.set(cacheKey, promise);
+
+  return promise;
+};
+
+// ─────────────────────────────────────────────────────────────
+// EXPRESS
+// ─────────────────────────────────────────────────────────────
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
-// POST /music/prefetch
-app.post("/music/prefetch", (req, res) => {
-  try {
-    const urls = Array.isArray(req.body?.videoUrls) ? req.body.videoUrls : [];
-    for (const u of urls.slice(0, 50)) {
-      if (typeof u === "string" && u.trim())
-        enqueuePrefetch(u.trim(), "prefetch-api");
-    }
-    return res.json({ queued: urls.length });
-  } catch (e) {
-    return res.status(400).json({ message: "Invalid request" });
-  }
-});
-
-// GET /music/stream/:videoId — bypass search, direct stream by known videoId
-app.get("/music/stream/:videoId", async (req, res) => {
-  const { videoId } = req.params;
-  if (!videoId) return res.status(400).json({ message: "Missing videoId" });
-
-  const start = Date.now();
-
-  try {
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    const { streamUrl } = await getOrFetchStream(videoUrl);
-
-    console.log(
-      `[stream] resolved videoId="${videoId}" in ${Date.now() - start}ms`,
-    );
-
-    return res.json({ streamUrl, videoId });
-  } catch (err) {
-    console.warn(`[stream] failed videoId="${videoId}":`, err?.message);
-    return res.status(404).json({ message: "Stream not found" });
-  }
-});
-
-// POST /music/stream-best — search + resolve best stream
-app.post("/music/stream-best", async (req, res) => {
-  const start = Date.now();
-
-  try {
-    const query = String(req.body?.query ?? "").trim();
-
-    if (!query) {
-      return res.status(400).json({ message: "Missing query" });
-    }
-
-    const videoIds = await collectStreamCandidateIds(query);
-
-    if (!videoIds.length) {
-      return res.status(404).json({ message: "No candidates found" });
-    }
-
-    // Race top 5, return first winner
-    const results = await Promise.any(
-      videoIds.slice(0, 5).map(async (id) => {
-        const videoUrl = `https://www.youtube.com/watch?v=${id}`;
-        const { streamUrl } = await getOrFetchStream(videoUrl);
-        return { streamUrl, videoId: id };
-      }),
-    );
-
-    console.log(`[stream-best] resolved "${query}" in ${Date.now() - start}ms`);
-
-    return res.json({
-      streamUrl: results.streamUrl,
-      videoId: results.videoId, // return videoId for client to cache
-    });
-  } catch (err) {
-    console.warn(`[stream-best] failed "${req.body?.query}":`, err?.message);
-    return res.status(404).json({ message: "No playable stream found" });
-  }
-});
+// ─────────────────────────────────────────────────────────────
+// HEALTH
+// ─────────────────────────────────────────────────────────────
 
 app.get("/", (_, res) => {
-  res.send("Music backend running");
+  return res.json({
+    status: "ok",
+    service: "music-backend",
+  });
 });
-// ─── Start ────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// ─────────────────────────────────────────────────────────────
+// SEARCH MUSIC
+// ─────────────────────────────────────────────────────────────
+
+app.get("/music/search", async (req, res) => {
+  const totalStart = now();
+
+  try {
+    const query = String(req.query.q || "").trim();
+
+    if (!query) {
+      return res.status(400).json({
+        message: "Missing query",
+      });
+    }
+
+    const results = await searchYouTube(query);
+
+    logTime(`/music/search TOTAL`, totalStart);
+
+    return res.json(results);
+  } catch (err) {
+    console.error(err);
+
+    return res.status(500).json({
+      message: err.message,
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// GET MP3 FROM URL
+// ─────────────────────────────────────────────────────────────
+
+app.get("/music/mp3", async (req, res) => {
+  const totalStart = now();
+
+  try {
+    const url = String(req.query.url || "").trim();
+
+    if (!url) {
+      return res.status(400).json({
+        message: "Missing url",
+      });
+    }
+
+    const data = await getOrFetchMp3(url);
+
+    logTime(`/music/mp3 TOTAL`, totalStart);
+
+    return res.json(data);
+  } catch (err) {
+    console.error(err);
+
+    return res.status(500).json({
+      message: err.message,
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// SEARCH + AUTO MP3
+// ─────────────────────────────────────────────────────────────
+
+app.post("/music/mp3", async (req, res) => {
+  const totalStart = now();
+
+  try {
+    const query = String(req.body.query || "").trim();
+
+    if (!query) {
+      return res.status(400).json({
+        message: "Missing query",
+      });
+    }
+
+    const results = await searchYouTube(query);
+
+    if (!results.length) {
+      return res.status(404).json({
+        message: "No results found",
+      });
+    }
+
+    const best = results[0];
+
+    const mp3 = await getOrFetchMp3(best.url);
+
+    logTime(`POST /music/mp3 TOTAL`, totalStart);
+
+    return res.json({
+      query,
+      video: best,
+      mp3,
+    });
+  } catch (err) {
+    console.error(err);
+
+    return res.status(500).json({
+      message: err.message,
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// START
+// ─────────────────────────────────────────────────────────────
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
