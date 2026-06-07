@@ -133,7 +133,7 @@ const fetchAudioUrl = async (videoUrl) =>
     const info = await ytDlp(videoUrl, {
       dumpSingleJson: true,
       noPlaylist: true,
-      format: "bestaudio[ext=m4a]/bestaudio",
+      format: "bestaudio",
       noWarnings: true,
       cookies: "./youtube-cookies.txt",
     });
