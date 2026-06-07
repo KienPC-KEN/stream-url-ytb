@@ -1,7 +1,9 @@
 import express from "express";
 import cors from "cors";
 import NodeCache from "node-cache";
-import yts from "@vreden/youtube_scraper";
+import search from "@distube/ytsr";
+import youtubeDlExec from "youtube-dl-exec";
+const { create } = youtubeDlExec;
 
 // ─────────────────────────────────────────────────────────────
 // CONFIG
@@ -9,8 +11,8 @@ import yts from "@vreden/youtube_scraper";
 
 const PORT = process.env.PORT || 3000;
 
-const SEARCH_CACHE_TTL = 600;
-const MP3_CACHE_TTL = 900;
+const SEARCH_CACHE_TTL = 60 * 10; // 10 phút
+const AUDIO_CACHE_TTL = 60 * 60 * 5; // 5 giờ (URL expire sau ~6h)
 
 // ─────────────────────────────────────────────────────────────
 // CACHE
@@ -20,297 +22,228 @@ const searchCache = new NodeCache({
   stdTTL: SEARCH_CACHE_TTL,
   checkperiod: 120,
 });
+const audioCache = new NodeCache({ stdTTL: AUDIO_CACHE_TTL, checkperiod: 300 });
 
-const mp3Cache = new NodeCache({
-  stdTTL: MP3_CACHE_TTL,
-  checkperiod: 120,
-});
-
+// Dedup: tránh gọi trùng request đang pending
 const pendingSearches = new Map();
-const pendingMp3 = new Map();
+const pendingAudio = new Map();
 
 // ─────────────────────────────────────────────────────────────
 // LOGGER
 // ─────────────────────────────────────────────────────────────
 
-const now = () => performance.now();
-
-const logTime = (label, start) => {
-  const ms = (now() - start).toFixed(0);
-
-  console.log(`⚡ ${label}: ${ms}ms`);
-};
+const t = () => performance.now();
+const logTime = (label, start) =>
+  console.log(`⚡ ${label}: ${(t() - start).toFixed(0)}ms`);
 
 // ─────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const retry = async (fn, retries = 2) => {
+const retry = async (fn, retries = 2, delay = 500) => {
   let lastError;
-
   for (let i = 0; i <= retries; i++) {
     try {
       return await fn();
     } catch (err) {
       lastError = err;
-
-      if (i < retries) {
-        await sleep(500);
-      }
+      if (i < retries) await sleep(delay);
     }
   }
-
   throw lastError;
 };
 
-const filterResults = (results = []) => {
-  return results
-    .filter((item) => {
-      const title = String(item.title || "").toLowerCase();
-
-      return (
-        !title.includes("karaoke") &&
-        !title.includes("live") &&
-        !title.includes("remix") &&
-        !title.includes("slowed") &&
-        !title.includes("8d")
-      );
-    })
-    .slice(0, 5)
-    .map((item) => ({
-      title: item.title,
-      url: item.url,
-      thumbnail: item.thumbnail,
-      duration: item.duration,
-    }));
+// Wrap một async task với dedup: nếu đang pending thì chờ chung
+const withDedup = (map, key, fn) => {
+  if (map.has(key)) return map.get(key);
+  const promise = fn().finally(() => map.delete(key));
+  map.set(key, promise);
+  return promise;
 };
 
 // ─────────────────────────────────────────────────────────────
 // SEARCH
 // ─────────────────────────────────────────────────────────────
 
-const searchYouTube = async (query) => {
-  const normalized = query.toLowerCase().trim();
+const FILTER_KEYWORDS = ["karaoke", "live", "remix", "slowed", "8d", "reverb"];
 
-  const cacheKey = `search:${normalized}`;
-
-  const cached = searchCache.get(cacheKey);
-
-  if (cached) {
-    console.log(`🟢 SEARCH CACHE HIT: ${normalized}`);
-
-    return cached;
-  }
-
-  console.log(`🟡 SEARCH CACHE MISS: ${normalized}`);
-
-  if (pendingSearches.has(cacheKey)) {
-    return pendingSearches.get(cacheKey);
-  }
-
-  const promise = retry(async () => {
-    const start = now();
-
-    const results = await yts.search(normalized);
-
-    logTime(`YouTube search "${normalized}"`, start);
-
-    const filtered = filterResults(results.results || []);
-
-    searchCache.set(cacheKey, filtered);
-
-    return filtered;
-  }).finally(() => {
-    pendingSearches.delete(cacheKey);
-  });
-
-  pendingSearches.set(cacheKey, promise);
-
-  return promise;
+const parseDurationSeconds = (duration) => {
+  if (!duration) return 0;
+  const parts = duration.split(":").map(Number);
+  return parts.length === 3
+    ? parts[0] * 3600 + parts[1] * 60 + parts[2]
+    : parts[0] * 60 + parts[1];
 };
 
-// ─────────────────────────────────────────────────────────────
-// MP3
-// ─────────────────────────────────────────────────────────────
-
-const fetchMp3 = async (url) => {
-  return retry(async () => {
-    const start = now();
-
-    const data = await yts.ytmp3(url, 92);
-
-    logTime(`MP3 fetch`, start);
-
-    if (!data?.download) {
-      throw new Error("MP3 not found");
-    }
-
-    return data.download;
-  });
-};
-
-const getOrFetchMp3 = async (url) => {
-  const cacheKey = `mp3:${url}`;
-
-  const cached = mp3Cache.get(cacheKey);
-
-  if (cached) {
-    console.log(`🟢 MP3 CACHE HIT`);
-
-    return cached;
-  }
-
-  console.log(`🟡 MP3 CACHE MISS`);
-
-  if (pendingMp3.has(cacheKey)) {
-    return pendingMp3.get(cacheKey);
-  }
-
-  const promise = fetchMp3(url)
-    .then((data) => {
-      mp3Cache.set(cacheKey, data);
-
-      return data;
+const normalizeResults = (items = []) =>
+  items
+    .filter((item) => {
+      if (item.type !== "video") return false;
+      const title = (item.name || "").toLowerCase();
+      if (FILTER_KEYWORDS.some((kw) => title.includes(kw))) return false;
+      if (parseDurationSeconds(item.duration) > 600) return false;
+      return true;
     })
-    .finally(() => {
-      pendingMp3.delete(cacheKey);
+    .slice(0, 5)
+    .map((item) => ({
+      title: item.name,
+      url: item.url,
+      thumbnail: item.thumbnail?.url ?? item.bestThumbnail?.url,
+      duration: item.duration,
+    }));
+
+const searchYouTube = async (query) => {
+  const key = `search:${query.toLowerCase().trim()}`;
+  const cached = searchCache.get(key);
+
+  if (cached) {
+    console.log(`🟢 SEARCH HIT: ${query}`);
+    return cached;
+  }
+
+  console.log(`🟡 SEARCH MISS: ${query}`);
+
+  return withDedup(pendingSearches, key, () =>
+    retry(async () => {
+      const start = t();
+      const res = await search(query, { limit: 15, safeSearch: false });
+      logTime(`search "${query}"`, start);
+
+      const filtered = normalizeResults(res.items);
+      searchCache.set(key, filtered);
+      return filtered;
+    }),
+  );
+};
+
+// ─────────────────────────────────────────────────────────────
+// AUDIO URL  — dùng yt-dlp (ổn định, luôn được update)
+// ─────────────────────────────────────────────────────────────
+
+// youtube-dl-exec tự bundle yt-dlp binary, không cần cài tay
+const ytDlp = create("yt-dlp");
+
+const fetchAudioUrl = async (videoUrl) =>
+  retry(async () => {
+    const start = t();
+
+    // --dump-json: chỉ lấy metadata, không download file
+    const info = await ytDlp(videoUrl, {
+      dumpSingleJson: true,
+      noPlaylist: true,
+      format: "bestaudio[ext=m4a]/bestaudio",
+      noWarnings: true,
     });
 
-  pendingMp3.set(cacheKey, promise);
+    if (!info?.url) throw new Error("No audio URL from yt-dlp");
 
-  return promise;
+    logTime(`audio url fetch (yt-dlp)`, start);
+
+    return {
+      url: info.url,
+      mimeType: info.ext === "m4a" ? "audio/mp4" : `audio/${info.ext}`,
+      bitrate: info.abr ?? info.tbr,
+      duration: info.duration,
+      expireAt: Date.now() + AUDIO_CACHE_TTL * 1000,
+    };
+  });
+
+const getAudio = async (videoUrl) => {
+  const key = `audio:${videoUrl}`;
+  const cached = audioCache.get(key);
+
+  if (cached) {
+    console.log(`🟢 AUDIO HIT`);
+    return cached;
+  }
+
+  console.log(`🟡 AUDIO MISS`);
+
+  return withDedup(pendingAudio, key, () =>
+    fetchAudioUrl(videoUrl).then((data) => {
+      audioCache.set(key, data);
+      return data;
+    }),
+  );
 };
 
 // ─────────────────────────────────────────────────────────────
-// EXPRESS
+// APP
 // ─────────────────────────────────────────────────────────────
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
-// ─────────────────────────────────────────────────────────────
-// HEALTH
-// ─────────────────────────────────────────────────────────────
+// ─── Health ───────────────────────────────────────────────────
 
-app.get("/", (_, res) => {
-  return res.json({
-    status: "ok",
-    service: "music-backend",
-  });
-});
+app.get("/", (_, res) => res.json({ status: "ok", service: "music-backend" }));
 
-// ─────────────────────────────────────────────────────────────
-// SEARCH MUSIC
-// ─────────────────────────────────────────────────────────────
+// ─── GET /music/search?q=... ──────────────────────────────────
 
 app.get("/music/search", async (req, res) => {
-  const totalStart = now();
-
+  const start = t();
   try {
     const query = String(req.query.q || "").trim();
-
-    if (!query) {
-      return res.status(400).json({
-        message: "Missing query",
-      });
-    }
+    if (!query)
+      return res.status(400).json({ message: "Missing query param: q" });
 
     const results = await searchYouTube(query);
-
-    logTime(`/music/search TOTAL`, totalStart);
-
+    logTime("/music/search TOTAL", start);
     return res.json(results);
   } catch (err) {
     console.error(err);
-
-    return res.status(500).json({
-      message: err.message,
-    });
+    return res.status(500).json({ message: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// GET MP3 FROM URL
-// ─────────────────────────────────────────────────────────────
+// ─── GET /music/audio?url=... ─────────────────────────────────
+//     Trả về audio URL từ một YouTube URL cụ thể
 
-app.get("/music/mp3", async (req, res) => {
-  const totalStart = now();
-
+app.get("/music/audio", async (req, res) => {
+  const start = t();
   try {
     const url = String(req.query.url || "").trim();
+    if (!url)
+      return res.status(400).json({ message: "Missing query param: url" });
 
-    if (!url) {
-      return res.status(400).json({
-        message: "Missing url",
-      });
-    }
-
-    const data = await getOrFetchMp3(url);
-
-    logTime(`/music/mp3 TOTAL`, totalStart);
-
+    const data = await getAudio(url);
+    logTime("/music/audio TOTAL", start);
     return res.json(data);
   } catch (err) {
     console.error(err);
-
-    return res.status(500).json({
-      message: err.message,
-    });
+    return res.status(500).json({ message: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// SEARCH + AUTO MP3
-// ─────────────────────────────────────────────────────────────
+// ─── POST /music/audio  { "query": "tên bài" } ───────────────
+//     Search + tự động lấy audio URL của kết quả đầu tiên
 
-app.post("/music/mp3", async (req, res) => {
-  const totalStart = now();
-
+app.post("/music/audio", async (req, res) => {
+  const start = t();
   try {
     const query = String(req.body.query || "").trim();
 
-    if (!query) {
-      return res.status(400).json({
-        message: "Missing query",
-      });
-    }
+    if (!query)
+      return res.status(400).json({ message: "Missing body field: query" });
 
     const results = await searchYouTube(query);
-
-    if (!results.length) {
-      return res.status(404).json({
-        message: "No results found",
-      });
-    }
+    if (!results.length)
+      return res.status(404).json({ message: "No results found" });
 
     const best = results[0];
+    const audio = await getAudio(best.url);
 
-    const mp3 = await getOrFetchMp3(best.url);
-
-    logTime(`POST /music/mp3 TOTAL`, totalStart);
-
-    return res.json({
-      query,
-      video: best,
-      mp3,
-    });
+    logTime("POST /music/audio TOTAL", start);
+    return res.json({ query, video: best, audio });
   } catch (err) {
     console.error(err);
-
-    return res.status(500).json({
-      message: err.message,
-    });
+    return res.status(500).json({ message: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// START
-// ─────────────────────────────────────────────────────────────
-
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
