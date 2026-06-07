@@ -123,7 +123,7 @@ const searchYouTube = async (query) => {
 // ─────────────────────────────────────────────────────────────
 
 // youtube-dl-exec tự bundle yt-dlp binary, không cần cài tay
-const ytDlp = create("/usr/local/bin/yt-dlp");
+const ytDlp = create("yt-dlp");
 
 const fetchAudioUrl = async (videoUrl) =>
   retry(async () => {
@@ -243,6 +243,14 @@ app.post("/music/audio", async (req, res) => {
     return res.status(500).json({ message: err.message });
   }
 });
+
+import { execSync } from "child_process";
+
+try {
+  console.log(execSync("which yt-dlp").toString());
+} catch {
+  console.log("yt-dlp not found");
+}
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
