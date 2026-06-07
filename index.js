@@ -5,6 +5,14 @@ import search from "@distube/ytsr";
 import youtubeDlExec from "youtube-dl-exec";
 const { create } = youtubeDlExec;
 
+import fs from "fs";
+
+console.log("cookies exists:", fs.existsSync("./youtube-cookies.txt"));
+
+if (fs.existsSync("./youtube-cookies.txt")) {
+  console.log(fs.readFileSync("./youtube-cookies.txt", "utf8").slice(0, 300));
+}
+
 // ─────────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────────
