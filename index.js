@@ -123,7 +123,7 @@ const searchYouTube = async (query) => {
 // ─────────────────────────────────────────────────────────────
 
 // youtube-dl-exec tự bundle yt-dlp binary, không cần cài tay
-const ytDlp = create("yt-dlp");
+const ytDlp = create("/usr/local/bin/yt-dlp");
 
 const fetchAudioUrl = async (videoUrl) =>
   retry(async () => {
