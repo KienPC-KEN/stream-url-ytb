@@ -135,6 +135,7 @@ const fetchAudioUrl = async (videoUrl) =>
       noPlaylist: true,
       format: "bestaudio[ext=m4a]/bestaudio",
       noWarnings: true,
+      cookies: "./youtube-cookies.txt",
     });
 
     if (!info?.url) throw new Error("No audio URL from yt-dlp");
