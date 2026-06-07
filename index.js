@@ -5,14 +5,6 @@ import search from "@distube/ytsr";
 import youtubeDlExec from "youtube-dl-exec";
 const { create } = youtubeDlExec;
 
-import fs from "fs";
-
-console.log("cookies exists:", fs.existsSync("./youtube-cookies.txt"));
-
-if (fs.existsSync("./youtube-cookies.txt")) {
-  console.log(fs.readFileSync("./youtube-cookies.txt", "utf8").slice(0, 300));
-}
-
 // ─────────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────────
@@ -141,10 +133,8 @@ const fetchAudioUrl = async (videoUrl) =>
     const info = await ytDlp(videoUrl, {
       dumpSingleJson: true,
       noPlaylist: true,
-      format: "bestaudio",
+      format: "bestaudio[ext=m4a]/bestaudio",
       noWarnings: true,
-      cookies: "./youtube-cookies.txt",
-      extractorArgs: "youtube:player_client=android",
     });
 
     if (!info?.url) throw new Error("No audio URL from yt-dlp");
@@ -253,14 +243,6 @@ app.post("/music/audio", async (req, res) => {
     return res.status(500).json({ message: err.message });
   }
 });
-
-import { execSync } from "child_process";
-
-try {
-  console.log(execSync("which yt-dlp").toString());
-} catch {
-  console.log("yt-dlp not found");
-}
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
