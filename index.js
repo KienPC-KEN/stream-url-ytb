@@ -1,21 +1,25 @@
 import express from "express";
 import cors from "cors";
 import NodeCache from "node-cache";
-import search from "@distube/ytsr";
 import youtubeDlExec from "youtube-dl-exec";
+
 const { create } = youtubeDlExec;
+const ytDlp = create("yt-dlp");
 
 // ─────────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
+const SEARCH_CACHE_TTL = 60 * 10;
+const AUDIO_CACHE_TTL = 60 * 60 * 5;
 
-const SEARCH_CACHE_TTL = 60 * 10; // 10 phút
-const AUDIO_CACHE_TTL = 60 * 60 * 5; // 5 giờ (URL expire sau ~6h)
+const FILTER_KEYWORDS = ["karaoke", "live", "remix", "slowed", "8d", "reverb"];
+const MAX_DURATION_SEC = 600;
+const SEARCH_LIMIT = 10;
 
 // ─────────────────────────────────────────────────────────────
-// CACHE
+// CACHE & DEDUP
 // ─────────────────────────────────────────────────────────────
 
 const searchCache = new NodeCache({
@@ -24,25 +28,26 @@ const searchCache = new NodeCache({
 });
 const audioCache = new NodeCache({ stdTTL: AUDIO_CACHE_TTL, checkperiod: 300 });
 
-// Dedup: tránh gọi trùng request đang pending
 const pendingSearches = new Map();
 const pendingAudio = new Map();
 
+const withDedup = (map, key, fn) => {
+  if (map.has(key)) return map.get(key);
+  const promise = fn().finally(() => map.delete(key));
+  map.set(key, promise);
+  return promise;
+};
+
 // ─────────────────────────────────────────────────────────────
-// LOGGER
+// UTILS
 // ─────────────────────────────────────────────────────────────
 
-const t = () => performance.now();
+const now = () => performance.now();
 const logTime = (label, start) =>
-  console.log(`⚡ ${label}: ${(t() - start).toFixed(0)}ms`);
-
-// ─────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────
-
+  console.log(`⚡ ${label}: ${(now() - start).toFixed(0)}ms`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const retry = async (fn, retries = 2, delay = 500) => {
+const retry = async (fn, retries = 2, delay = 300) => {
   let lastError;
   for (let i = 0; i <= retries; i++) {
     try {
@@ -55,111 +60,109 @@ const retry = async (fn, retries = 2, delay = 500) => {
   throw lastError;
 };
 
-// Wrap một async task với dedup: nếu đang pending thì chờ chung
-const withDedup = (map, key, fn) => {
-  if (map.has(key)) return map.get(key);
-  const promise = fn().finally(() => map.delete(key));
-  map.set(key, promise);
-  return promise;
-};
-
 // ─────────────────────────────────────────────────────────────
-// SEARCH
+// SEARCH — dùng yt-dlp thay @distube/ytsr (ổn định hơn)
 // ─────────────────────────────────────────────────────────────
 
-const FILTER_KEYWORDS = ["karaoke", "live", "remix", "slowed", "8d", "reverb"];
-
-const parseDurationSeconds = (duration) => {
-  if (!duration) return 0;
-  const parts = duration.split(":").map(Number);
-  return parts.length === 3
-    ? parts[0] * 3600 + parts[1] * 60 + parts[2]
-    : parts[0] * 60 + parts[1];
-};
-
-const normalizeResults = (items = []) =>
-  items
-    .filter((item) => {
-      if (item.type !== "video") return false;
-      const title = (item.name || "").toLowerCase();
-      if (FILTER_KEYWORDS.some((kw) => title.includes(kw))) return false;
-      if (parseDurationSeconds(item.duration) > 600) return false;
-      return true;
-    })
-    .slice(0, 5)
-    .map((item) => ({
-      title: item.name,
-      url: item.url,
-      thumbnail: item.thumbnail?.url ?? item.bestThumbnail?.url,
-      duration: item.duration,
-    }));
-
-const searchYouTube = async (query) => {
+const searchYouTube = (query) => {
   const key = `search:${query.toLowerCase().trim()}`;
   const cached = searchCache.get(key);
 
   if (cached) {
     console.log(`🟢 SEARCH HIT: ${query}`);
-    return cached;
+    return Promise.resolve(cached);
   }
 
   console.log(`🟡 SEARCH MISS: ${query}`);
 
   return withDedup(pendingSearches, key, () =>
     retry(async () => {
-      const start = t();
-      const res = await search(query, { limit: 15, safeSearch: false });
+      const start = now();
+
+      // ytsearch{N}: tìm N kết quả trên YouTube
+      const results = await ytDlp(`ytsearch${SEARCH_LIMIT}:${query}`, {
+        dumpSingleJson: true,
+        noWarnings: true,
+        noCheckCertificates: true,
+        flatPlaylist: true, // chỉ lấy metadata, không fetch từng video
+      });
+
       logTime(`search "${query}"`, start);
 
-      const filtered = normalizeResults(res.items);
-      searchCache.set(key, filtered);
-      return filtered;
+      const items = (results?.entries ?? [])
+        .filter((e) => {
+          const title = (e.title || "").toLowerCase();
+          if (FILTER_KEYWORDS.some((kw) => title.includes(kw))) return false;
+          if ((e.duration ?? 0) > MAX_DURATION_SEC) return false;
+          return true;
+        })
+        .slice(0, 5)
+        .map((e) => ({
+          title: e.title,
+          url: `https://www.youtube.com/watch?v=${e.id}`,
+          thumbnail: e.thumbnail,
+          duration: e.duration, // số giây
+        }));
+
+      searchCache.set(key, items);
+      return items;
     }),
   );
 };
 
-// ─────────────────────────────────────────────────────────────
-// AUDIO URL  — dùng yt-dlp (ổn định, luôn được update)
-// ─────────────────────────────────────────────────────────────
-
-// youtube-dl-exec tự bundle yt-dlp binary, không cần cài tay
-const ytDlp = create("yt-dlp");
-
-const fetchAudioUrl = async (videoUrl) =>
+const fetchAudioUrl = (videoUrl) =>
   retry(async () => {
-    const start = t();
-
-    // --dump-json: chỉ lấy metadata, không download file
-    const info = await ytDlp(videoUrl, {
+    const start = now();
+    const result = await ytDlp(videoUrl, {
       dumpSingleJson: true,
       noPlaylist: true,
-      format: "bestaudio[ext=m4a]/bestaudio",
+      format: "bestaudio[ext=m4a][vcodec=none]",
       noWarnings: true,
+      noCheckCertificates: true,
     });
+    const audioFormat = result.formats
+      ?.filter(
+        (f) =>
+          f.acodec !== "none" &&
+          f.vcodec === "none" &&
+          f.protocol !== "m3u8_native" &&
+          f.protocol !== "m3u8" &&
+          f.ext === "m4a",
+      )
+      ?.sort((a, b) => (b.abr || 0) - (a.abr || 0))[0];
 
-    if (!info?.url) throw new Error("No audio URL from yt-dlp");
-
-    logTime(`audio url fetch (yt-dlp)`, start);
-
+    const audioUrl = audioFormat?.url;
+    if (!audioUrl?.startsWith("http")) {
+      throw new Error("No audio URL from yt-dlp");
+    }
+    logTime("audio url (yt-dlp)", start);
+    console.log({
+      duration: result.duration,
+      selectedDuration: audioFormat?.duration,
+      protocol: audioFormat?.protocol,
+      ext: audioFormat?.ext,
+      abr: audioFormat?.abr,
+      formatId: audioFormat?.format_id,
+    });
     return {
-      url: info.url,
-      mimeType: info.ext === "m4a" ? "audio/mp4" : `audio/${info.ext}`,
-      bitrate: info.abr ?? info.tbr,
-      duration: info.duration,
+      url: audioUrl,
+      duration: result.duration ?? 0,
+      mimeType: result.ext ?? "audio/mp4",
+      bitrate: result.abr ?? null,
       expireAt: Date.now() + AUDIO_CACHE_TTL * 1000,
     };
   });
 
-const getAudio = async (videoUrl) => {
+const getAudioUrl = (videoUrl) => {
   const key = `audio:${videoUrl}`;
   const cached = audioCache.get(key);
 
   if (cached) {
-    console.log(`🟢 AUDIO HIT`);
-    return cached;
+    console.log("🟢 AUDIO HIT");
+    return Promise.resolve(cached);
   }
 
-  console.log(`🟡 AUDIO MISS`);
+  console.log("🟡 AUDIO MISS");
 
   return withDedup(pendingAudio, key, () =>
     fetchAudioUrl(videoUrl).then((data) => {
@@ -169,63 +172,16 @@ const getAudio = async (videoUrl) => {
   );
 };
 
-// ─────────────────────────────────────────────────────────────
-// APP
-// ─────────────────────────────────────────────────────────────
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── Health ───────────────────────────────────────────────────
-
 app.get("/", (_, res) => res.json({ status: "ok", service: "music-backend" }));
 
-// ─── GET /music/search?q=... ──────────────────────────────────
-
-app.get("/music/search", async (req, res) => {
-  const start = t();
-  try {
-    const query = String(req.query.q || "").trim();
-    if (!query)
-      return res.status(400).json({ message: "Missing query param: q" });
-
-    const results = await searchYouTube(query);
-    logTime("/music/search TOTAL", start);
-    return res.json(results);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: err.message });
-  }
-});
-
-// ─── GET /music/audio?url=... ─────────────────────────────────
-//     Trả về audio URL từ một YouTube URL cụ thể
-
-app.get("/music/audio", async (req, res) => {
-  const start = t();
-  try {
-    const url = String(req.query.url || "").trim();
-    if (!url)
-      return res.status(400).json({ message: "Missing query param: url" });
-
-    const data = await getAudio(url);
-    logTime("/music/audio TOTAL", start);
-    return res.json(data);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: err.message });
-  }
-});
-
-// ─── POST /music/audio  { "query": "tên bài" } ───────────────
-//     Search + tự động lấy audio URL của kết quả đầu tiên
-
 app.post("/music/audio", async (req, res) => {
-  const start = t();
+  const start = now();
   try {
     const query = String(req.body.query || "").trim();
-
     if (!query)
       return res.status(400).json({ message: "Missing body field: query" });
 
@@ -234,16 +190,17 @@ app.post("/music/audio", async (req, res) => {
       return res.status(404).json({ message: "No results found" });
 
     const best = results[0];
-    const audio = await getAudio(best.url);
+    const audio = await getAudioUrl(best.url);
 
     logTime("POST /music/audio TOTAL", start);
-    return res.json({ query, video: best, audio });
+
+    return res.json({ video: best, audio: audio });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: err.message });
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`🚀 Server running on port ${PORT}`),
+);
