@@ -181,7 +181,7 @@ const getAudioByUrl = (videoUrl) => {
 
     // TV_EMBEDDED: không trả ads/companion → parser không crash
     // ANDROID: fallback nếu TV_EMBEDDED bị block (hiếm)
-    const clients = ["TV_EMBEDDED", "ANDROID"];
+    const clients = ["ANDROID", "TV_EMBEDDED"];
     let info = null;
 
     for (const client of clients) {
